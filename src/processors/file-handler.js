@@ -22,6 +22,7 @@ import {FileReader} from 'global/window';
 import Console from 'global/console';
 import { parse, parseInBatches } from '@loaders.gl/core';
 import { JSONLoader } from '@loaders.gl/json';
+import { CSVLoader } from '@loaders.gl/csv';
 import {
   processCsvData,
   processGeojson,
@@ -83,19 +84,8 @@ export function getFileType(filename) {
   return 'other';
 }
 
-function readCSVFile(fileBlob) {
-  return new Promise((resolve, reject) => {
-    const fileReader = new FileReader();
-    fileReader.onload = ({target: {result}}) => {
-      resolve(result);
-    };
-
-    fileReader.readAsText(fileBlob);
-  });
-}
-
 export function loadCsv({file, format, processor = processCsvData}) {
-  return readCSVFile(file).then(rawData => (rawData ? {data: processor(rawData), format} : null));
+  return readCSVFile(file).then(data => (data ? {data: processor(data), format} : null));
 }
 
 export function loadJSON({file, processor = processGeojson}) {
@@ -141,6 +131,23 @@ async function* fileReaderAsyncIterable(file, chunkSize) {
   }
 }
 
+async function parseFileInBatchesCSV(file) {
+  const chunkSize = 1024 * 1024; // 1MB, biggest value that keeps UI responsive
+  const batchIterator = await parseInBatches(
+    fileReaderAsyncIterable(file, chunkSize),
+    CSVLoader,
+    {
+       header: false
+    }
+  );
+  let batches = [];
+  for await (const batch of batchIterator) {
+    batches = batches.concat(batch.data);
+  }
+
+  return batches;
+}
+
 async function parseFileInBatches(file) {
   const chunkSize = 1024 * 1024; // 1MB, biggest value that keeps UI responsive
   const batchIterator = await parseInBatches(
@@ -182,6 +189,22 @@ async function parseFileInBatches(file) {
   return result;
 }
 
+function parseFileCSV(file) {
+  return new Promise((resolve, reject) => {
+    const fileReader = new FileReader(file);
+    fileReader.onload = async ({target: {result}}) => {
+      try {
+        const csv = await parse(result, CSVLoader, { header: false });
+        resolve(csv);
+      } catch(e) {
+        reject(e);
+      }
+    };
+    fileReader.onerror = reject;
+    fileReader.onabort = reject;
+    fileReader.readAsText(file, 'UTF-8');
+  });
+}
 
 function parseFile(file) {
   return new Promise((resolve, reject) => {
@@ -198,6 +221,14 @@ function parseFile(file) {
     fileReader.onabort = reject;
     fileReader.readAsText(file, 'UTF-8');
   });
+}
+
+function readCSVFile(file) {
+  // Don't read as string files with a size 250MB or bigger because it may
+  // exceed the browsers maximum string length.
+  return file.size >= 250 * 1024 * 1024
+    ? parseFileInBatchesCSV(file)
+    : parseFileCSV(file);
 }
 
 export function readJSONFile(file) {
