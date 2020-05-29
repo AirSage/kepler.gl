@@ -20,7 +20,7 @@
 
 import {FileReader} from 'global/window';
 import Console from 'global/console';
-import { parse, parseInBatches } from '@loaders.gl/core';
+import { parse, parseInBatches, registerLoaders } from '@loaders.gl/core';
 import { JSONLoader } from '@loaders.gl/json';
 import { CSVLoader } from '@loaders.gl/csv';
 import {
@@ -29,87 +29,57 @@ import {
   processKeplerglJSON,
   processRowObject
 } from './data-processor';
-import {isPlainObject, generateHashId} from 'utils/utils';
-import {DATASET_FORMATS} from 'constants/default-settings';
+import {isPlainObject, generateHashId} from 'utils/utils'; import {DATASET_FORMATS} from 'constants/default-settings';
 
-const FILE_HANDLERS = {
-  csv: loadCsv,
-  json: loadJSON
-};
+registerLoaders([JSONLoader, CSVLoader]);
 
-export function readFile({file, fileCache = []}) {
-  return new Promise((resolve, reject) => {
-    const {handler, format} = getFileHandler(file);
-    if (!handler) {
-      Console.warn(
-        `Canont determine file handler for file ${file.name}. It must have a valid file extension`
-      );
-      resolve(fileCache);
-    }
-
-    handler({file, format}).then(result => {
-      if (!result || !result.data) {
-        // return fileCache, to keep process other files
-        resolve(fileCache);
-      }
-      resolve([
-        ...fileCache,
-        {
-          data: result.data,
-          info: {
-            label: file.name,
-            format: result.format
-          }
-        }
-      ]);
-    });
-  });
-}
-
-export function getFileHandler(fileBlob) {
-  const type = getFileType(fileBlob.name);
-
-  return {handler: FILE_HANDLERS[type], format: type};
-}
-
-export function getFileType(filename) {
-  if (filename.endsWith('csv')) {
-    return 'csv';
-  } else if (filename.endsWith('json') || filename.endsWith('geojson')) {
-    // Read GeoJson from browser
-    return 'json';
+export async function readFile({file, fileCache = []}) {
+  const result = await loadFile(file);
+  if (!result || !result.data) {
+    Console.warn(`Cannot parse file ${file.name}.`);
+    // return fileCache, to keep process other files
+    return fileCache;
   }
-
-  // Wait to add other file type handler
-  return 'other';
-}
-
-export function loadCsv({file, format, processor = processCsvData}) {
-  return readCSVFile(file).then(data => (data ? {data: processor(data), format} : null));
-}
-
-export function loadJSON({file, processor = processGeojson}) {
-  return readJSONFile(file).then(content => {
-    if (isKeplerGlMap(content)) {
-      return {
-        format: DATASET_FORMATS.keplergl,
-        data: processKeplerglJSON(content)
-      };
-    } else if (isRowObject(content)) {
-      return {
-        format: DATASET_FORMATS.row,
-        data: processRowObject(content)
-      };
-    } else if (isGeoJson(content)) {
-      return {
-        format: DATASET_FORMATS.geojson,
-        data: processGeojson(content)
-      };
+  return [
+    ...fileCache,
+    {
+      data: result.data,
+      info: {
+        label: file.name,
+        format: result.format
+      }
     }
-    // unsupported json format
-    Console.warn(`unsupported Json format ${file.name}`);
-    return null;
-  });
+  ];
+}
+
+export async function loadFile(file) {
+  // Don't read as string files with a size 250MB or bigger because it may
+  // exceed the browsers maximum string length.
+  const content = file.size >= 250 * 1024 * 1024
+    ? await parseFileInBatches(file)
+    : await parseFile(file);
+  if (Array.isArray(content)) {
+    return {
+      format: 'csv',
+      data: processCsvData(content)
+    }
+  } else if (isKeplerGlMap(content)) {
+    return {
+      format: DATASET_FORMATS.keplergl,
+      data: processKeplerglJSON(content)
+    };
+  } else if (isRowObject(content)) {
+    return {
+      format: DATASET_FORMATS.row,
+      data: processRowObject(content)
+    };
+  } else if (isGeoJson(content)) {
+    return {
+      format: DATASET_FORMATS.geojson,
+      data: processGeojson(content)
+    };
+  }
+  return null;
 }
 
 async function* fileReaderAsyncIterable(file, chunkSize) {
@@ -131,30 +101,14 @@ async function* fileReaderAsyncIterable(file, chunkSize) {
   }
 }
 
-async function parseFileInBatchesCSV(file) {
-  const chunkSize = 1024 * 1024; // 1MB, biggest value that keeps UI responsive
-  const batchIterator = await parseInBatches(
-    fileReaderAsyncIterable(file, chunkSize),
-    CSVLoader,
-    {
-       header: false
-    }
-  );
-  let batches = [];
-  for await (const batch of batchIterator) {
-    batches = batches.concat(batch.data);
-  }
-
-  return batches;
-}
-
 async function parseFileInBatches(file) {
   const chunkSize = 1024 * 1024; // 1MB, biggest value that keeps UI responsive
   const batchIterator = await parseInBatches(
     fileReaderAsyncIterable(file, chunkSize),
-    JSONLoader,
     {
+      csv: { header: false },
       json: { _rootObjectBatches: true }
+
     }
   );
   let result = {};
@@ -186,24 +140,9 @@ async function parseFileInBatches(file) {
       batches = batches.concat(batch.data);
     }
   }
-  return result;
-}
-
-function parseFileCSV(file) {
-  return new Promise((resolve, reject) => {
-    const fileReader = new FileReader(file);
-    fileReader.onload = async ({target: {result}}) => {
-      try {
-        const csv = await parse(result, CSVLoader, { header: false });
-        resolve(csv);
-      } catch(e) {
-        reject(e);
-      }
-    };
-    fileReader.onerror = reject;
-    fileReader.onabort = reject;
-    fileReader.readAsText(file, 'UTF-8');
-  });
+  return Object.keys(result).length === 0 // csv doesn't have any keys
+    ? batches
+    : result;
 }
 
 function parseFile(file) {
@@ -211,8 +150,10 @@ function parseFile(file) {
     const fileReader = new FileReader(file);
     fileReader.onload = async ({target: {result}}) => {
       try {
-        const json = await parse(result, JSONLoader);
-        resolve(json);
+        const data = await parse(result, {
+          csv: { header: false }
+        });
+        resolve(data);
       } catch(e) {
         reject(e);
       }
@@ -221,22 +162,6 @@ function parseFile(file) {
     fileReader.onabort = reject;
     fileReader.readAsText(file, 'UTF-8');
   });
-}
-
-function readCSVFile(file) {
-  // Don't read as string files with a size 250MB or bigger because it may
-  // exceed the browsers maximum string length.
-  return file.size >= 250 * 1024 * 1024
-    ? parseFileInBatchesCSV(file)
-    : parseFileCSV(file);
-}
-
-export function readJSONFile(file) {
-  // Don't read as string files with a size 250MB or bigger because it may
-  // exceed the browsers maximum string length.
-  return file.size >= 250 * 1024 * 1024
-    ? parseFileInBatches(file)
-    : parseFile(file);
 }
 
 export function isGeoJson(json) {
